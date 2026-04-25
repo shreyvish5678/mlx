@@ -16,12 +16,20 @@
     instantiate_attn(iname, itype, 32, 32,  80, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  64, 4, 1, mname, mtype)
 
+#define instantiate_attn_shapes_256_helper(iname, itype, mname, mtype) \
+    instantiate_attn_shapes_helper(iname, itype, mname, mtype)         \
+    instantiate_attn(iname, itype, 32, 16, 256, 4, 1, mname, mtype)
+
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, bool_, bool)
 
-instantiate_attn_mask_helper(float16, half);
-instantiate_attn_mask_helper(bfloat16, bfloat16_t);
+#define instantiate_attn_mask_256_helper(iname, itype) \
+    instantiate_attn_shapes_256_helper(iname, itype, iname, itype) \
+    instantiate_attn_shapes_256_helper(iname, itype, bool_, bool)
+
+instantiate_attn_mask_256_helper(float16, half);
+instantiate_attn_mask_256_helper(bfloat16, bfloat16_t);
 
 instantiate_attn_mask_helper(float32, float);
 // clang-format on

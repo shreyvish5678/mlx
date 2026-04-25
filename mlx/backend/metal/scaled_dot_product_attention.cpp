@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -14,6 +15,34 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Chunked SDPA configuration — env-var overridable for testing
+// ---------------------------------------------------------------------------
+
+int sdpa_full_chunk_threshold() {
+  static int val = -1;
+  if (val < 0) {
+    if (auto* env = std::getenv("MLX_SDPA_CHUNK_THRESHOLD")) {
+      val = std::atoi(env);
+    } else {
+      val = 65536;
+    }
+  }
+  return val;
+}
+
+int sdpa_full_chunk_size() {
+  static int val = -1;
+  if (val < 0) {
+    if (auto* env = std::getenv("MLX_SDPA_CHUNK_SIZE")) {
+      val = std::atoi(env);
+    } else {
+      val = 32768;
+    }
+  }
+  return val;
+}
 
 void sdpa_full_self_attention_nax(
     const Stream& s,
@@ -163,7 +192,18 @@ void sdpa_full_self_attention_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-void sdpa_full_self_attention_metal(
+// ---------------------------------------------------------------------------
+// Chunked SDPA dispatch
+//
+// Splits K/V along the sequence dimension into chunks, dispatches
+// steel_attention per chunk with output_logsumexp=true, then merges
+// chunk outputs using sdpa_chunked_reduce (logsumexp-weighted averaging).
+//
+// This keeps individual attention dispatches bounded for large key sequences
+// and prevents GPU watchdog timeouts at 65K+ keys.
+// ---------------------------------------------------------------------------
+
+void sdpa_full_self_attention_chunked(
     const Stream& s,
     metal::Device& d,
     const array& q,
@@ -174,7 +214,254 @@ void sdpa_full_self_attention_metal(
     bool do_causal_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
-  if (metal::is_nax_available() && q.shape(3) != 80 &&
+  using namespace mlx::steel;
+
+  const int chunk_size = sdpa_full_chunk_size();
+
+  // Block dimensions for steel_attention (same as sdpa_full_self_attention_metal)
+  int wm = 4;
+  int wn = 1;
+  int bd = q.shape(-1);
+  int bq = 32;
+  int bk = bd < 128 ? 32 : 16;
+
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  int qL = q.shape(2);
+  int full_kL = k.shape(2);
+
+  // Number of chunks
+  int n_chunks = (full_kL + chunk_size - 1) / chunk_size;
+
+  // Allocate temporary buffers for per-chunk outputs and logsumexp values
+  // chunk_outs: [n_chunks, B*H*qL*D] contiguous
+  // chunk_lses: [n_chunks, B*H*qL] contiguous (float32)
+  int64_t BHqL = int64_t(B) * int64_t(H) * int64_t(qL);
+  int64_t BHqLD = BHqL * int64_t(D);
+
+  array chunk_outs(
+      {n_chunks, B * H, qL, D}, q.dtype(), nullptr, {});
+  chunk_outs.set_data(allocator::malloc(
+      int64_t(n_chunks) * BHqLD * int64_t(q.itemsize())));
+
+  array chunk_lses(
+      {n_chunks, B * H, qL}, float32, nullptr, {});
+  chunk_lses.set_data(allocator::malloc(
+      int64_t(n_chunks) * BHqL * int64_t(size_of(float32))));
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(chunk_outs);
+  compute_encoder.add_temporary(chunk_lses);
+
+  // --- Per-chunk attention dispatch ---
+  for (int c = 0; c < n_chunks; c++) {
+    int k_start = c * chunk_size;
+    int chunk_kL = std::min(chunk_size, full_kL - k_start);
+
+    // Per-chunk causal offset: query position i can attend to key position
+    // j (within this chunk) iff  i + qL_off >= j
+    // where qL_off = (full_kL - qL) - k_start
+    // This shifts the causal window so that absolute positions are preserved.
+    int chunk_qL_off = (full_kL - qL) - k_start;
+
+    const bool align_Q = (qL % bq) == 0;
+    const bool align_K = (chunk_kL % bk) == 0;
+    const bool has_mask = false;  // masks not supported in chunked path
+    const bool do_causal = do_causal_;
+    const bool has_sinks_chunk = (c == 0 && sinks.has_value());
+    const bool output_lse = true;
+
+    int NQ = (qL + bq - 1) / bq;
+    int NK = (chunk_kL + bk - 1) / bk;
+    int NQ_aligned = qL / bq;
+    int NK_aligned = chunk_kL / bk;
+
+    // Chunk output strides: contiguous [B*H, qL, D]
+    int64_t co_str_bh = int64_t(qL) * int64_t(D);
+    int64_t co_str_q = int64_t(D);
+    int64_t co_str_d = 1;
+
+    AttnParams params{
+        /* int B = */ B,
+        /* int H = */ H,
+        /* int D = */ D,
+
+        /* int qL = */ qL,
+        /* int kL = */ chunk_kL,
+
+        /* int gqa_factor = */ gqa_factor,
+        /* float scale = */ scale,
+
+        /* int NQ = */ NQ,
+        /* int NK = */ NK,
+
+        /* int NQ_aligned = */ NQ_aligned,
+        /* int NK_aligned = */ NK_aligned,
+
+        /* int qL_rem = */ (qL - NQ_aligned * bq),
+        /* int kL_rem = */ (chunk_kL - NK_aligned * bk),
+        /* int qL_off = */ chunk_qL_off,
+
+        /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+        /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+        /* int64_t O_strides[3] = */ {co_str_bh, co_str_bh, co_str_q}};
+    // Note: O_strides for chunk outputs:
+    //   strides(0) = batch stride = H * qL * D  (but we flatten B*H, so
+    //                use co_str_bh for both batch and head since the chunk
+    //                output is [B*H, qL, D], and the kernel indexes as
+    //                batch * O_strides[0] + head * O_strides[1] + seq * O_strides[2])
+    // Since chunk_outs is [n_chunks, B*H, qL, D]:
+    //   batch stride = H * qL * D
+    //   head stride  = qL * D
+    //   seq stride   = D
+    int64_t batch_stride_co = int64_t(H) * co_str_bh;
+    params.O_strides[0] = batch_stride_co;
+    params.O_strides[1] = co_str_bh;
+    params.O_strides[2] = co_str_q;
+
+    // Function constants for this chunk
+    metal::MTLFCList func_consts = {
+        {&align_Q, MTL::DataType::DataTypeBool, 200},
+        {&align_K, MTL::DataType::DataTypeBool, 201},
+        {&has_mask, MTL::DataType::DataTypeBool, 300},
+        {&do_causal, MTL::DataType::DataTypeBool, 301},
+        {&has_sinks_chunk, MTL::DataType::DataTypeBool, 302},
+        {&output_lse, MTL::DataType::DataTypeBool, 304}};
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "steel_attention_",
+        type_to_name(q),
+        "_bq", bq,
+        "_bk", bk,
+        "_bd", bd,
+        "_wm", wm,
+        "_wn", wn,
+        "_mask", type_to_name(q));  // no mask, use q dtype as placeholder
+
+    std::string hash_name;
+    concatenate(
+        hash_name,
+        base_name,
+        "_align_Q_", (align_Q ? 't' : 'n'),
+        "_align_K_", (align_K ? 't' : 'n'),
+        "_has_mask_n",
+        "_do_causal_", (do_causal ? 't' : 'n'),
+        "_has_sinks_", (has_sinks_chunk ? 't' : 'n'),
+        "_lse_t");
+
+    auto kernel = get_steel_attention_kernel(
+        d, base_name, hash_name, func_consts,
+        q, bq, bk, bd, wm, wn, q);  // mask_type = q (placeholder, has_mask=false)
+
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    // Bind Q (unchanged across chunks)
+    compute_encoder.set_input_array(q, 0);
+
+    // Bind K with byte offset into chunk start
+    int64_t k_byte_offset = int64_t(k_start) * k.strides(2) * int64_t(k.itemsize());
+    compute_encoder.set_input_array(k, 1, k_byte_offset);
+
+    // Bind V with byte offset into chunk start
+    int64_t v_byte_offset = int64_t(k_start) * v.strides(2) * int64_t(v.itemsize());
+    compute_encoder.set_input_array(v, 2, v_byte_offset);
+
+    // Bind chunk output with byte offset for this chunk
+    int64_t co_byte_offset = int64_t(c) * BHqLD * int64_t(q.itemsize());
+    compute_encoder.set_output_array(chunk_outs, 3, co_byte_offset);
+
+    compute_encoder.set_bytes(params, 4);
+
+    // No mask (has_mask=false), so skip buffers 5 and 6
+
+    // Sinks: only on chunk 0
+    if (has_sinks_chunk) {
+      compute_encoder.set_input_array(*sinks, 7);
+    }
+
+    // LSE output for this chunk
+    int64_t lse_byte_offset = int64_t(c) * BHqL * int64_t(size_of(float32));
+    compute_encoder.set_output_array(chunk_lses, 8, lse_byte_offset);
+
+    MTL::Size grid_dims = MTL::Size(NQ, H, B);
+    MTL::Size group_dims = MTL::Size(32, wm, wn);
+
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // --- Reduction: merge chunk outputs via logsumexp-weighted averaging ---
+  {
+    std::string reduce_kname = "sdpa_chunked_reduce_" + type_to_name(q);
+    auto reduce_kernel = d.get_kernel(reduce_kname);
+    compute_encoder.set_compute_pipeline_state(reduce_kernel);
+
+    // Buffer 0: chunk_outs
+    compute_encoder.set_input_array(chunk_outs, 0);
+    // Buffer 1: chunk_lses
+    compute_encoder.set_input_array(chunk_lses, 1);
+    // Buffer 2: final output
+    compute_encoder.set_output_array(o, 2);
+    // Buffer 3: n_chunks
+    compute_encoder.set_bytes(n_chunks, 3);
+    // Buffer 4: D
+    compute_encoder.set_bytes(D, 4);
+    // Buffer 5: qL
+    compute_encoder.set_bytes(qL, 5);
+    // Buffer 6: H
+    compute_encoder.set_bytes(H, 6);
+    // Buffer 7: O_strides (3 x int64_t) — strides of the final output o
+    int64_t o_strides[3] = {o.strides(0), o.strides(1), o.strides(2)};
+    compute_encoder.set_bytes(o_strides, 7);
+    // Buffer 8: BHqL
+    int BHqL_int = static_cast<int>(BHqL);
+    compute_encoder.set_bytes(BHqL_int, 8);
+
+    // dispatch_threads: grid = (D, qL, B*H), one thread per output element
+    MTL::Size grid = MTL::Size(D, qL, B * H);
+    MTL::Size group = MTL::Size(
+        std::min(D, 32),
+        std::min(qL, 32),
+        1);
+    // Clamp total threadgroup size
+    int total = std::min(D, 32) * std::min(qL, 32);
+    if (total > 1024) {
+      // Scale down to fit Metal's max threadgroup size
+      group = MTL::Size(std::min(D, 32), 1024 / std::min(D, 32), 1);
+    }
+    compute_encoder.dispatch_threads(grid, group);
+  }
+}
+
+void sdpa_full_self_attention_metal(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    const float scale,
+    array& o,
+    bool do_causal_,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks,
+    bool output_logsumexp_flag,
+    array* lse) {
+  // Route to chunked dispatch when kL exceeds the threshold.
+  // Chunked path does not support explicit masks or caller logsumexp output.
+  int kL_check = k.shape(2);
+  if (kL_check >= sdpa_full_chunk_threshold() &&
+      !output_logsumexp_flag && !mask.has_value()) {
+    return sdpa_full_self_attention_chunked(
+        s, d, q, k, v, scale, o, do_causal_, mask, sinks);
+  }
+
+  // NAX path does not support logsumexp output
+  if (!output_logsumexp_flag && metal::is_nax_available() && q.shape(3) != 80 &&
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -217,7 +504,8 @@ void sdpa_full_self_attention_metal(
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&output_logsumexp_flag, MTL::DataType::DataTypeBool, 304}};
 
   std::string base_name;
   concatenate(
@@ -250,7 +538,9 @@ void sdpa_full_self_attention_metal(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-      (has_sinks ? 't' : 'n'));
+      (has_sinks ? 't' : 'n'),
+      "_lse_",
+      (output_logsumexp_flag ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -318,6 +608,9 @@ void sdpa_full_self_attention_metal(
   }
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 7);
+  }
+  if (output_logsumexp_flag && lse != nullptr) {
+    compute_encoder.set_output_array(*lse, 8);
   }
 
   MTL::Size grid_dims = MTL::Size(NQ, H, B);
@@ -600,9 +893,6 @@ bool ScaledDotProductAttention::use_fallback(
     // forward and backward.
     return true;
   }
-  if (output_logsumexp) {
-    return true;
-  }
   if (s.device == Device::cpu) {
     return true;
   }
@@ -620,7 +910,8 @@ bool ScaledDotProductAttention::use_fallback(
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
        query_head_dim == 256);
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
+       (query_head_dim == 256 && q.dtype() != float32));
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);
@@ -628,7 +919,9 @@ bool ScaledDotProductAttention::use_fallback(
   const bool supports_sdpa_full = query_sequence_length > 8 &&
       sdpa_full_supported_mask && sdpa_full_supported_head_dim;
 
-  const bool supports_sdpa_vector = (query_sequence_length <= 8) &&
+  // Vector kernels do not support logsumexp output
+  const bool supports_sdpa_vector = !output_logsumexp &&
+      (query_sequence_length <= 8) &&
       (query_sequence_length <= key_sequence_length) &&
       sdpa_vector_supported_head_dim &&
       (query_sequence_length * gqa_factor) <= 32;
@@ -778,8 +1071,17 @@ void ScaledDotProductAttention::eval_gpu(
         ? std::optional<array>{copy_unless(is_matrix_contiguous, inputs[3])}
         : std::nullopt;
 
+    // Set up logsumexp output if requested
+    bool lse_flag = output_logsumexp_ && outputs.size() > 1;
+    array* lse_ptr = nullptr;
+    if (lse_flag) {
+      auto& lse = outputs[1];
+      lse.set_data(allocator::malloc(lse.nbytes()));
+      lse_ptr = &lse;
+    }
+
     sdpa_full_self_attention_metal(
-        s, d, q, k, v, scale_, o, do_causal_, mask, sinks);
+        s, d, q, k, v, scale_, o, do_causal_, mask, sinks, lse_flag, lse_ptr);
   }
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
