@@ -12,10 +12,7 @@
   attention, dtype, bq, bk, bd, wm, wn, mtype, float)
 
 #define instantiate_attn_shapes_helper(iname, itype, mname, mtype)  \
-<<<<<<< HEAD
-=======
     instantiate_attn(iname, itype, 32, 16, 256, 4, 1, mname, mtype) \
->>>>>>> a04ef24c (Initial commit)
     instantiate_attn(iname, itype, 32, 16, 128, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  80, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  64, 4, 1, mname, mtype)

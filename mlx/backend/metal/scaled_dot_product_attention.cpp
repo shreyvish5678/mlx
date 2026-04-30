@@ -1,9 +1,6 @@
 // Copyright © 2024 Apple Inc.
-<<<<<<< HEAD
-=======
 #include <algorithm>
 #include <cstdlib>
->>>>>>> a04ef24c (Initial commit)
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -20,8 +17,6 @@ namespace mlx::core::fast {
 
 namespace {
 
-<<<<<<< HEAD
-=======
 int sdpa_full_chunk_threshold() {
   if (auto* env = std::getenv("MLX_SDPA_CHUNK_THRESHOLD")) {
     int value = std::atoi(env);
@@ -38,7 +33,6 @@ int sdpa_full_chunk_size() {
   return 32768;
 }
 
->>>>>>> a04ef24c (Initial commit)
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -187,8 +181,6 @@ void sdpa_full_self_attention_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-<<<<<<< HEAD
-=======
 void sdpa_full_self_attention_chunked(
     const Stream& s,
     metal::Device& d,
@@ -367,7 +359,6 @@ void sdpa_full_self_attention_chunked(
   compute_encoder.dispatch_threads(grid, group);
 }
 
->>>>>>> a04ef24c (Initial commit)
 void sdpa_full_self_attention_metal(
     const Stream& s,
     metal::Device& d,
@@ -379,16 +370,12 @@ void sdpa_full_self_attention_metal(
     bool do_causal_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
-<<<<<<< HEAD
-  if (metal::is_nax_available() && q.shape(3) != 80 &&
-=======
   if (k.shape(2) >= sdpa_full_chunk_threshold() && !mask.has_value()) {
     return sdpa_full_self_attention_chunked(
         s, d, q, k, v, scale, o, do_causal_, sinks);
   }
 
   if (metal::is_nax_available() && q.shape(3) != 80 && q.shape(3) != 256 &&
->>>>>>> a04ef24c (Initial commit)
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -425,22 +412,15 @@ void sdpa_full_self_attention_metal(
   const bool has_mask = mask.has_value();
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
-<<<<<<< HEAD
-=======
   const bool output_logsumexp = false;
->>>>>>> a04ef24c (Initial commit)
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-<<<<<<< HEAD
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
-=======
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
       {&output_logsumexp, MTL::DataType::DataTypeBool, 304}};
->>>>>>> a04ef24c (Initial commit)
 
   std::string base_name;
   concatenate(
@@ -473,12 +453,8 @@ void sdpa_full_self_attention_metal(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-<<<<<<< HEAD
-      (has_sinks ? 't' : 'n'));
-=======
       (has_sinks ? 't' : 'n'),
       "_lse_n");
->>>>>>> a04ef24c (Initial commit)
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -846,18 +822,12 @@ bool ScaledDotProductAttention::use_fallback(
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-<<<<<<< HEAD
-       query_head_dim == 256);
-  const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
-=======
        query_head_dim == 192 || query_head_dim == 256);
   const bool sdpa_full_256_ok =
       query_head_dim == 256 && key_sequence_length > 16384;
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
        sdpa_full_256_ok);
->>>>>>> a04ef24c (Initial commit)
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);

@@ -14,10 +14,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
-<<<<<<< HEAD
-=======
 constant bool output_logsumexp [[function_constant(304)]];
->>>>>>> a04ef24c (Initial commit)
 
 struct MaxOp {
   template <typename T>
@@ -80,10 +77,7 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
-<<<<<<< HEAD
-=======
     device float* lse_out [[buffer(8), function_constant(output_logsumexp)]],
->>>>>>> a04ef24c (Initial commit)
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -481,8 +475,6 @@ template <
   } else {
     Otile.template store<T, 1, 1>(O, params->O_strides[2]);
   }
-<<<<<<< HEAD
-=======
 
   if (output_logsumexp) {
     STEEL_PRAGMA_UNROLL
@@ -496,5 +488,4 @@ template <
       }
     }
   }
->>>>>>> a04ef24c (Initial commit)
 }

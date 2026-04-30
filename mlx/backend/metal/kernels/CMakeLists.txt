@@ -54,11 +54,8 @@ build_kernel(random)
 build_kernel(rms_norm)
 build_kernel(rope)
 build_kernel(scaled_dot_product_attention sdpa_vector.h)
-<<<<<<< HEAD
-=======
 build_kernel(steel/attn/kernels/sdpa_chunked_reduce
              steel/attn/kernels/sdpa_chunked_reduce.h)
->>>>>>> a04ef24c (Initial commit)
 if(MLX_METAL_VERSION GREATER_EQUAL 320)
   build_kernel(fence)
 endif()

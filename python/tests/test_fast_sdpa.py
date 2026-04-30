@@ -116,8 +116,6 @@ def mlx_primitives_sdpa(q, k, v, scale, mask=None):
     return scores @ v
 
 
-<<<<<<< HEAD
-=======
 class temporary_env:
     def __init__(self, **values):
         self.values = values
@@ -136,7 +134,6 @@ class temporary_env:
                 os.environ[key] = value
 
 
->>>>>>> a04ef24c (Initial commit)
 class TestFastSDPA(mlx_tests.MLXTestCase):
     def test_sdpa_vector_kv_transposed_head_seq(self):
         D = 64
@@ -464,8 +461,6 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 diff = mx.abs(out_fst - out_ref) - atol * mx.abs(out_ref)
                 self.assertLessEqual(mx.max(diff).item(), atol)
 
-<<<<<<< HEAD
-=======
     @unittest.skipIf(not mx.metal.is_available(), "Metal-only SDPA dispatch")
     def test_sdpa_full_head_dim_256_inference(self):
         D = 256
@@ -537,7 +532,6 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             mx.allclose(chunked_causal, normal_causal, atol=1e-3, rtol=1e-3)
         )
 
->>>>>>> a04ef24c (Initial commit)
     @unittest.skipIf(not mx.is_available(mx.gpu), "too slow on CPU")
     @unittest.skipIf(mx.cuda.is_available() and "CI" in os.environ, "not enough memory")
     def test_sdpa_long_masked_sequence(self):
