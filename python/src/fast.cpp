@@ -293,8 +293,178 @@ void init_fast(nb::module_& parent_module) {
             k = mx.random.normal(shape=(B, N_kv, T_kv, D))
             v = mx.random.normal(shape=(B, N_kv, T_kv, D))
             scale = D ** -0.5
-            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
-      )pbdoc");
+	            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
+	      )pbdoc");
+
+  m.def(
+      "quantized_scaled_dot_product_attention",
+      [](const mx::array& queries,
+         const mx::array& q_keys,
+         const mx::array& key_scales,
+         const mx::array& key_biases,
+         const mx::array& q_values,
+         const mx::array& value_scales,
+         const mx::array& value_biases,
+         const float scale,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         const int group_size,
+         const int bits,
+         mx::StreamOrDevice s) {
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              std::ostringstream msg;
+              msg << "[quantized_scaled_dot_product_attention] invalid mask option '"
+                  << mask_str << "'. Must be 'causal', or an array.";
+              throw std::invalid_argument(msg.str());
+            }
+            return mx::fast::quantized_scaled_dot_product_attention(
+                queries,
+                q_keys,
+                key_scales,
+                key_biases,
+                q_values,
+                value_scales,
+                value_biases,
+                scale,
+                mask_str,
+                std::nullopt,
+                group_size,
+                bits,
+                s);
+          }
+          auto mask_arr = std::get<mx::array>(mask);
+          return mx::fast::quantized_scaled_dot_product_attention(
+              queries,
+              q_keys,
+              key_scales,
+              key_biases,
+              q_values,
+              value_scales,
+              value_biases,
+              scale,
+              "array",
+              mask_arr,
+              group_size,
+              bits,
+              s);
+        }
+        return mx::fast::quantized_scaled_dot_product_attention(
+            queries,
+            q_keys,
+            key_scales,
+            key_biases,
+            q_values,
+            value_scales,
+            value_biases,
+            scale,
+            "",
+            std::nullopt,
+            group_size,
+            bits,
+            s);
+      },
+      "q"_a,
+      "q_keys"_a,
+      "key_scales"_a,
+      "key_biases"_a,
+      "q_values"_a,
+      "value_scales"_a,
+      "value_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def quantized_scaled_dot_product_attention(q: array, q_keys: array, key_scales: array, key_biases: array, q_values: array, value_scales: array, value_biases: array, *, scale: float, mask: Union[None, str, array] = None, group_size: int = 64, bits: int = 4, stream: Union[None, Stream, Device] = None) -> array"));
+
+  m.def(
+      "quantized_scaled_dot_product_attention",
+      [](const mx::array& queries,
+         const std::tuple<mx::array, mx::array, mx::array>& q_keys,
+         const std::tuple<mx::array, mx::array, mx::array>& q_values,
+         const float scale,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         const int group_size,
+         const int bits,
+         mx::StreamOrDevice s) {
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              std::ostringstream msg;
+              msg << "[quantized_scaled_dot_product_attention] invalid mask option '"
+                  << mask_str << "'. Must be 'causal', or an array.";
+              throw std::invalid_argument(msg.str());
+            }
+            return mx::fast::quantized_scaled_dot_product_attention(
+                queries,
+                std::get<0>(q_keys),
+                std::get<1>(q_keys),
+                std::get<2>(q_keys),
+                std::get<0>(q_values),
+                std::get<1>(q_values),
+                std::get<2>(q_values),
+                scale,
+                mask_str,
+                std::nullopt,
+                group_size,
+                bits,
+                s);
+          }
+          auto mask_arr = std::get<mx::array>(mask);
+          return mx::fast::quantized_scaled_dot_product_attention(
+              queries,
+              std::get<0>(q_keys),
+              std::get<1>(q_keys),
+              std::get<2>(q_keys),
+              std::get<0>(q_values),
+              std::get<1>(q_values),
+              std::get<2>(q_values),
+              scale,
+              "array",
+              mask_arr,
+              group_size,
+              bits,
+              s);
+        }
+        return mx::fast::quantized_scaled_dot_product_attention(
+            queries,
+            std::get<0>(q_keys),
+            std::get<1>(q_keys),
+            std::get<2>(q_keys),
+            std::get<0>(q_values),
+            std::get<1>(q_values),
+            std::get<2>(q_values),
+            scale,
+            "",
+            std::nullopt,
+            group_size,
+            bits,
+            s);
+      },
+      "q"_a,
+      "q_keys"_a,
+      "q_values"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def quantized_scaled_dot_product_attention(q: array, q_keys: tuple[array, array, array], q_values: tuple[array, array, array], *, scale: float, mask: Union[None, str, array] = None, group_size: int = 64, bits: int = 4, stream: Union[None, Stream, Device] = None) -> array"));
 
   m.def(
       "metal_kernel",

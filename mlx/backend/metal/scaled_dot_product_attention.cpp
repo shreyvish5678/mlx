@@ -33,6 +33,23 @@ int sdpa_full_chunk_size() {
   return 32768;
 }
 
+int quantized_sdpa_chunk_size() {
+  if (auto* env = std::getenv("MLX_QUANTIZED_SDPA_CHUNK_SIZE")) {
+    int value = std::atoi(env);
+    return value > 0 ? value : 32768;
+  }
+  return 32768;
+}
+
+struct QuantizedKVStrides {
+  int64_t KQ_strides[3];
+  int64_t KS_strides[3];
+  int64_t KB_strides[3];
+  int64_t VQ_strides[3];
+  int64_t VS_strides[3];
+  int64_t VB_strides[3];
+};
+
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -329,6 +346,190 @@ void sdpa_full_self_attention_chunked(
     MTL::Size grid_dims = MTL::Size(NQ, H, B);
     MTL::Size group_dims = MTL::Size(32, wm, wn);
 
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  std::string reduce_kname = "sdpa_chunked_reduce_" + type_to_name(q);
+  auto reduce_kernel = d.get_kernel(reduce_kname);
+  compute_encoder.set_compute_pipeline_state(reduce_kernel);
+
+  compute_encoder.set_input_array(chunk_outs, 0);
+  compute_encoder.set_input_array(chunk_lses, 1);
+  compute_encoder.set_output_array(o, 2);
+  compute_encoder.set_bytes(n_chunks, 3);
+  compute_encoder.set_bytes(D, 4);
+  compute_encoder.set_bytes(qL, 5);
+  compute_encoder.set_bytes(H, 6);
+
+  int64_t o_strides[3] = {o.strides(0), o.strides(1), o.strides(2)};
+  compute_encoder.set_bytes(o_strides, 7);
+
+  int BHqL_int = static_cast<int>(BHqL);
+  compute_encoder.set_bytes(BHqL_int, 8);
+
+  MTL::Size grid = MTL::Size(D, qL, B * H);
+  MTL::Size group = MTL::Size(std::min(D, 32), std::min(qL, 32), 1);
+  int total = group.width * group.height;
+  if (total > 1024) {
+    group = MTL::Size(std::min(D, 32), 1024 / std::min(D, 32), 1);
+  }
+  compute_encoder.dispatch_threads(grid, group);
+}
+
+void quantized_sdpa_full_self_attention_chunked(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& qk,
+    const array& ks,
+    const array& kbias,
+    const array& qv,
+    const array& vs,
+    const array& vbias,
+    const float scale,
+    array& o,
+    bool do_causal_) {
+  using namespace mlx::steel;
+
+  const int chunk_size = quantized_sdpa_chunk_size();
+  const int full_kL = qk.shape(2);
+  const int n_chunks = (full_kL + chunk_size - 1) / chunk_size;
+
+  int wm = 4;
+  int wn = 1;
+  int bd = q.shape(-1);
+  int bq = 32;
+  int bk = 16;
+
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / qk.shape(1);
+  int qL = q.shape(2);
+
+  int64_t BHqL = int64_t(B) * int64_t(H) * int64_t(qL);
+  int64_t BHqLD = BHqL * int64_t(D);
+
+  array chunk_outs({n_chunks, B * H, qL, D}, q.dtype(), nullptr, {});
+  chunk_outs.set_data(
+      allocator::malloc(int64_t(n_chunks) * BHqLD * q.itemsize()));
+
+  array chunk_lses({n_chunks, B * H, qL}, float32, nullptr, {});
+  chunk_lses.set_data(
+      allocator::malloc(int64_t(n_chunks) * BHqL * size_of(float32)));
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(chunk_outs);
+  compute_encoder.add_temporary(chunk_lses);
+
+  for (int c = 0; c < n_chunks; c++) {
+    int k_start = c * chunk_size;
+    int chunk_kL = std::min(chunk_size, full_kL - k_start);
+    int chunk_qL_off = (full_kL - qL) - k_start;
+
+    const bool align_Q = (qL % bq) == 0;
+    const bool align_K = (chunk_kL % bk) == 0;
+    const bool do_causal = do_causal_;
+    const bool output_lse = true;
+
+    const int NQ = (qL + bq - 1) / bq;
+    const int NK = (chunk_kL + bk - 1) / bk;
+    const int NQ_aligned = qL / bq;
+    const int NK_aligned = chunk_kL / bk;
+
+    AttnParams params{
+        /* int B = */ B,
+        /* int H = */ H,
+        /* int D = */ D,
+        /* int qL = */ qL,
+        /* int kL = */ chunk_kL,
+        /* int gqa_factor = */ gqa_factor,
+        /* float scale = */ scale,
+        /* int NQ = */ NQ,
+        /* int NK = */ NK,
+        /* int NQ_aligned = */ NQ_aligned,
+        /* int NK_aligned = */ NK_aligned,
+        /* int qL_rem = */ (qL - NQ_aligned * bq),
+        /* int kL_rem = */ (chunk_kL - NK_aligned * bk),
+        /* int qL_off = */ chunk_qL_off,
+        /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* int64_t K_strides[3] = */ {},
+        /* int64_t V_strides[3] = */ {},
+        /* int64_t O_strides[3] = */
+        {int64_t(H) * qL * D, int64_t(qL) * D, D}};
+
+    QuantizedKVStrides qstrides{
+        /* int64_t KQ_strides[3] = */
+        {qk.strides(0), qk.strides(1), qk.strides(2)},
+        /* int64_t KS_strides[3] = */
+        {ks.strides(0), ks.strides(1), ks.strides(2)},
+        /* int64_t KB_strides[3] = */
+        {kbias.strides(0), kbias.strides(1), kbias.strides(2)},
+        /* int64_t VQ_strides[3] = */
+        {qv.strides(0), qv.strides(1), qv.strides(2)},
+        /* int64_t VS_strides[3] = */
+        {vs.strides(0), vs.strides(1), vs.strides(2)},
+        /* int64_t VB_strides[3] = */
+        {vbias.strides(0), vbias.strides(1), vbias.strides(2)}};
+
+    metal::MTLFCList func_consts = {
+        {&align_Q, MTL::DataType::DataTypeBool, 200},
+        {&align_K, MTL::DataType::DataTypeBool, 201},
+        {&do_causal, MTL::DataType::DataTypeBool, 301},
+        {&output_lse, MTL::DataType::DataTypeBool, 304}};
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "steel_quantized_attention_",
+        type_to_name(q),
+        "_bq",
+        bq,
+        "_bk",
+        bk,
+        "_bd",
+        bd,
+        "_wm",
+        wm,
+        "_wn",
+        wn);
+
+    std::string hash_name;
+    concatenate(
+        hash_name,
+        base_name,
+        "_align_Q_",
+        (align_Q ? 't' : 'n'),
+        "_align_K_",
+        (align_K ? 't' : 'n'),
+        "_do_causal_",
+        (do_causal ? 't' : 'n'),
+        "_lse_t");
+
+    auto kernel = d.get_kernel(base_name, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(
+        qk, 1, int64_t(k_start) * qk.strides(2) * qk.itemsize());
+    compute_encoder.set_input_array(
+        ks, 2, int64_t(k_start) * ks.strides(2) * ks.itemsize());
+    compute_encoder.set_input_array(
+        kbias, 3, int64_t(k_start) * kbias.strides(2) * kbias.itemsize());
+    compute_encoder.set_input_array(
+        qv, 4, int64_t(k_start) * qv.strides(2) * qv.itemsize());
+    compute_encoder.set_input_array(
+        vs, 5, int64_t(k_start) * vs.strides(2) * vs.itemsize());
+    compute_encoder.set_input_array(
+        vbias, 6, int64_t(k_start) * vbias.strides(2) * vbias.itemsize());
+    compute_encoder.set_output_array(
+        chunk_outs, 7, int64_t(c) * BHqLD * q.itemsize());
+    compute_encoder.set_bytes(params, 8);
+    compute_encoder.set_bytes(qstrides, 9);
+    compute_encoder.set_output_array(
+        chunk_lses, 10, int64_t(c) * BHqL * size_of(float32));
+
+    MTL::Size grid_dims = MTL::Size(NQ, H, B);
+    MTL::Size group_dims = MTL::Size(32, wm, wn);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
@@ -990,6 +1191,125 @@ void ScaledDotProductAttention::eval_gpu(
   }
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
+bool QuantizedScaledDotProductAttention::use_fallback(
+    const array& q,
+    const array& qk,
+    const array& ks,
+    const array& kb,
+    const array& qv,
+    const array& vs,
+    const array& vb,
+    bool has_arr_mask,
+    int group_size,
+    int bits,
+    Stream s) {
+  if (s.device == Device::cpu || has_arr_mask) {
+    return true;
+  }
+  if (bits != 4 || group_size != 64) {
+    return true;
+  }
+  if (q.shape(-1) != 256 || q.shape(2) <= 8) {
+    return true;
+  }
+  if (q.dtype() != ks.dtype() || q.dtype() != kb.dtype() ||
+      q.dtype() != vs.dtype() || q.dtype() != vb.dtype()) {
+    return true;
+  }
+  if (qk.dtype() != uint32 || qv.dtype() != uint32) {
+    return true;
+  }
+  if (q.shape(0) != qk.shape(0) || q.shape(0) != qv.shape(0)) {
+    return true;
+  }
+  if (qk.shape(1) != qv.shape(1) || q.shape(1) % qk.shape(1) != 0) {
+    return true;
+  }
+  if (qk.shape(2) != qv.shape(2)) {
+    return true;
+  }
+  if (qk.shape(3) != 32 || qv.shape(3) != 32) {
+    return true;
+  }
+  if (ks.shape(3) != 4 || kb.shape(3) != 4 || vs.shape(3) != 4 ||
+      vb.shape(3) != 4) {
+    return true;
+  }
+  return false;
+}
+
+void QuantizedScaledDotProductAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  const auto& q_pre = inputs[0];
+  const auto& qk_pre = inputs[1];
+  const auto& ks_pre = inputs[2];
+  const auto& kb_pre = inputs[3];
+  const auto& qv_pre = inputs[4];
+  const auto& vs_pre = inputs[5];
+  const auto& vb_pre = inputs[6];
+  auto& o = outputs[0];
+
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    }
+    return arr;
+  };
+
+  auto is_matrix_contiguous = [](const array& arr) {
+    return arr.strides(-1) == 1;
+  };
+  auto is_row_contiguous = [](const array& arr) {
+    return arr.flags().row_contiguous;
+  };
+
+  const auto& q = copy_unless(is_matrix_contiguous, q_pre);
+  const auto& qk = copy_unless(is_row_contiguous, qk_pre);
+  const auto& ks = copy_unless(is_row_contiguous, ks_pre);
+  const auto& kb = copy_unless(is_row_contiguous, kb_pre);
+  const auto& qv = copy_unless(is_row_contiguous, qv_pre);
+  const auto& vs = copy_unless(is_row_contiguous, vs_pre);
+  const auto& vb = copy_unless(is_row_contiguous, vb_pre);
+
+  int64_t str_oD = 1;
+  int64_t str_oH = o.shape(3);
+  int64_t str_oL = o.shape(1) * str_oH;
+  int64_t str_oB = o.shape(2) * str_oL;
+  size_t data_size = o.shape(0) * str_oB;
+  array::Flags flags{
+      /* bool contiguous = */ 1,
+      /* bool row_contiguous = */ 0,
+      /* bool col_contiguous = */ 0,
+  };
+  o.set_data(
+      allocator::malloc(o.nbytes()),
+      data_size,
+      {str_oB, str_oH, str_oL, str_oD},
+      flags);
+
+  quantized_sdpa_full_self_attention_chunked(
+      s, d, q, qk, ks, kb, qv, vs, vb, scale_, o, do_causal_);
+
+  metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
+bool QuantizedScaledDotProductAttention::is_equivalent(
+    const Primitive& other) const {
+  const QuantizedScaledDotProductAttention& q_other =
+      static_cast<const QuantizedScaledDotProductAttention&>(other);
+  return scale_ == q_other.scale_ && do_causal_ == q_other.do_causal_ &&
+      group_size_ == q_other.group_size_ && bits_ == q_other.bits_;
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {

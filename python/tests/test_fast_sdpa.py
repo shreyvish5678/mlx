@@ -532,6 +532,38 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             mx.allclose(chunked_causal, normal_causal, atol=1e-3, rtol=1e-3)
         )
 
+    @unittest.skipIf(not mx.metal.is_available(), "Metal-only SDPA dispatch")
+    def test_quantized_sdpa_chunked_head_dim_256(self):
+        D = 256
+        qL = 9
+        kL = 24
+        scale = D**-0.5
+        mx.random.seed(7)
+
+        q = mx.random.normal(shape=(1, 4, qL, D), dtype=mx.float16)
+        k = mx.random.normal(shape=(1, 2, kL, D), dtype=mx.float16)
+        v = mx.random.normal(shape=(1, 2, kL, D), dtype=mx.float16)
+        qk, ks, kb = mx.quantize(k, group_size=64, bits=4)
+        qv, vs, vb = mx.quantize(v, group_size=64, bits=4)
+        kd = mx.dequantize(qk, ks, kb, group_size=64, bits=4)
+        vd = mx.dequantize(qv, vs, vb, group_size=64, bits=4)
+
+        with temporary_env(MLX_QUANTIZED_SDPA_CHUNK_SIZE=16):
+            out = mx.fast.quantized_scaled_dot_product_attention(
+                q, qk, ks, kb, qv, vs, vb, scale=scale
+            )
+            out_causal = mx.fast.quantized_scaled_dot_product_attention(
+                q, qk, ks, kb, qv, vs, vb, scale=scale, mask="causal"
+            )
+
+        ref = mx.fast.scaled_dot_product_attention(q, kd, vd, scale=scale)
+        ref_causal = mx.fast.scaled_dot_product_attention(
+            q, kd, vd, scale=scale, mask="causal"
+        )
+
+        self.assertTrue(mx.allclose(out, ref, atol=2e-3, rtol=2e-3))
+        self.assertTrue(mx.allclose(out_causal, ref_causal, atol=3e-3, rtol=3e-3))
+
     @unittest.skipIf(not mx.is_available(mx.gpu), "too slow on CPU")
     @unittest.skipIf(mx.cuda.is_available() and "CI" in os.environ, "not enough memory")
     def test_sdpa_long_masked_sequence(self):
