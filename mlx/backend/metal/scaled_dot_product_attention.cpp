@@ -399,7 +399,7 @@ void quantized_sdpa_full_self_attention_chunked(
   int wm = bd == 512 ? 1 : 4;
   int wn = 1;
   int bq = bd == 512 ? 8 : 32;
-  int bk = 16;
+  int bk = bd == 512 ? 8 : 16;
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -1213,6 +1213,9 @@ bool QuantizedScaledDotProductAttention::use_fallback(
   }
   const auto head_dim = q.shape(-1);
   if ((head_dim != 256 && head_dim != 512) || q.shape(2) <= 8) {
+    return true;
+  }
+  if (head_dim == 512 && q.dtype() == float32) {
     return true;
   }
   if (q.dtype() != ks.dtype() || q.dtype() != kb.dtype() ||
