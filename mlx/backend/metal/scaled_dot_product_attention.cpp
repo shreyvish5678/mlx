@@ -395,10 +395,10 @@ void quantized_sdpa_full_self_attention_chunked(
   const int full_kL = qk.shape(2);
   const int n_chunks = (full_kL + chunk_size - 1) / chunk_size;
 
-  int wm = 4;
-  int wn = 1;
   int bd = q.shape(-1);
-  int bq = 32;
+  int wm = bd == 512 ? 1 : 4;
+  int wn = 1;
+  int bq = bd == 512 ? 8 : 32;
   int bk = 16;
 
   int B = q.shape(0);
@@ -1211,7 +1211,8 @@ bool QuantizedScaledDotProductAttention::use_fallback(
   if (bits != 4 || group_size != 64) {
     return true;
   }
-  if (q.shape(-1) != 256 || q.shape(2) <= 8) {
+  const auto head_dim = q.shape(-1);
+  if ((head_dim != 256 && head_dim != 512) || q.shape(2) <= 8) {
     return true;
   }
   if (q.dtype() != ks.dtype() || q.dtype() != kb.dtype() ||
@@ -1230,11 +1231,13 @@ bool QuantizedScaledDotProductAttention::use_fallback(
   if (qk.shape(2) != qv.shape(2)) {
     return true;
   }
-  if (qk.shape(3) != 32 || qv.shape(3) != 32) {
+  const auto packed_dim = head_dim / 8;
+  const auto affine_dim = head_dim / group_size;
+  if (qk.shape(3) != packed_dim || qv.shape(3) != packed_dim) {
     return true;
   }
-  if (ks.shape(3) != 4 || kb.shape(3) != 4 || vs.shape(3) != 4 ||
-      vb.shape(3) != 4) {
+  if (ks.shape(3) != affine_dim || kb.shape(3) != affine_dim ||
+      vs.shape(3) != affine_dim || vb.shape(3) != affine_dim) {
     return true;
   }
   return false;
