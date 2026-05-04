@@ -295,6 +295,57 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+class QuantizedScaledDotProductAttention : public Custom {
+ public:
+  QuantizedScaledDotProductAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      bool do_causal,
+      int group_size,
+      int bits)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        do_causal_(do_causal),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  static bool use_fallback(
+      const array& q,
+      const array& qk,
+      const array& ks,
+      const array& kb,
+      const array& qv,
+      const array& vs,
+      const array& vb,
+      bool has_arr_mask,
+      int group_size,
+      int bits,
+      Stream s);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(QuantizedScaledDotProductAttention);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, do_causal_, group_size_, bits_);
+  }
+
+ private:
+  float scale_;
+  bool do_causal_;
+  int group_size_;
+  int bits_;
+};
+
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)
